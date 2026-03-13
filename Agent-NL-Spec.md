@@ -17,10 +17,11 @@ This document is a language-agnostic NLSpec for implementing the AI Personal Tra
 9. [Delivery and Streaming](#9-delivery-and-streaming)
 10. [Policy, Plan Tiers, and Cost Controls](#10-policy-plan-tiers-and-cost-controls)
 11. [Safety, Redaction, and Compliance Controls](#11-safety-redaction-and-compliance-controls)
-12. [Provider Adapter Architecture](#12-provider-adapter-architecture)
-13. [Out of Scope (Current Version)](#13-out-of-scope-current-version)
-14. [Open Questions Requiring Clarification](#14-open-questions-requiring-clarification)
-15. [Definition of Done](#15-definition-of-done)
+12. [Prompt Layers and Lifecycle](#12-prompt-layers-and-lifecycle)
+13. [Provider Adapter Architecture](#13-provider-adapter-architecture)
+14. [Out of Scope (Current Version)](#14-out-of-scope-current-version)
+15. [Open Questions Requiring Clarification](#15-open-questions-requiring-clarification)
+16. [Definition of Done](#16-definition-of-done)
 
 ---
 
@@ -109,6 +110,9 @@ The system must support many concurrent users, preserve deterministic per-sessio
 9. Rate limiting policy must be tier-adjustable through plan defaults and user overrides.
 10. The gateway must return structured `429 Too Many Requests` responses with retry metadata when throughput or concurrency limits are exceeded.
 11. The system must emit observability metrics for request counts, admission decisions, rate-limit hits, active runs, active streams, and tier-level usage patterns.
+12. The gateway must validate request schema, authentication, authorization context, required headers, idempotency metadata, and cursor/query parameter shape before queueing work.
+13. Malformed or incomplete requests must be rejected at the gateway with deterministic `4xx` responses and must not reach worker queues.
+14. Invalid component actions, invalid session/run ownership, and malformed SSE resume cursors must be rejected before any downstream mutation.
 
 ```pseudocode
 FUNCTION admit_request(ctx: RequestContext) -> AdmissionDecision:
@@ -137,17 +141,26 @@ FUNCTION admit_request(ctx: RequestContext) -> AdmissionDecision:
 
 ### 2.4 UI and UX Model
 
-1. The product UI is a single-surface coach experience built as a chat feed with inline, backend-driven components.
-2. The primary user interaction methods are voice, text, and lightweight taps on inline components.
+1. The product UI is a single-surface coach experience built as a chat feed with backend-driven UI elements and a persistent workout tray.
+2. The primary user interaction methods are voice, text, and lightweight taps on feed items or tray actions.
 3. The screen must include a persistent input dock that keeps voice and text entry available at all times.
-4. The persistent input dock should support microphone state, text entry, send/submit behavior, and context-sensitive quick actions without leaving the main feed.
-5. The frontend must not be organized as many separate product screens for workout logging, planning, and review; these states should appear within one continuous conversation surface.
-6. The backend decides when to return plain assistant messages versus structured feed items such as exercise cards, rest timers, workout summaries, program updates, and insight cards.
-7. The frontend is primarily a renderer of ordered feed items and a dispatcher of user actions back to the backend.
-8. During a workout, the current exercise should be the dominant inline object in the feed while prior items recede into scrollable history.
-9. Workout sessions should be generated as a session structure up front, with remaining exercises updated live as the user completes, skips, swaps, or modifies the workout.
-10. The user should be able to speak naturally in shorthand relative to the active workout context, for example `done`, `add 5 lbs`, `swap this`, or `too hard`, without restating the full exercise context.
-11. The design goal is to make working out feel like following a real trainer: the user sees what matters now, responds naturally, and does not manage software complexity.
+4. The persistent input dock should support microphone state, live transcript capture, text entry, send/submit behavior, and context-sensitive quick actions without leaving the main feed.
+5. The persistent input dock should include a compact quick-action affordance, a text field that can expand when the user types, and a microphone control that supports clear on/off interaction states.
+6. Live speech transcription should appear in the dock text field while the user is speaking so that voice and text feel like one input system rather than separate modes.
+7. The frontend must not be organized as many separate product screens for workout logging, planning, and review; these states should appear within one continuous conversation surface.
+8. The backend decides when to return plain assistant messages versus structured feed items such as workout previews, workout summaries, program updates, insight cards, or other non-current-task UI components.
+9. The frontend is primarily a renderer of ordered feed items plus a persistent workout tray, and a dispatcher of user actions back to the backend.
+10. During a workout, the current exercise and rest state should live in the persistent workout tray rather than as the primary actionable object inline in the feed.
+11. Inline feed UI should be used for contextual or reflective information, such as workout previews, summaries, insights, or program updates, not as the main control surface for the current live exercise.
+12. Workout sessions should be generated as a session structure up front, with remaining exercises updated live as the user completes, skips, swaps, or modifies the workout.
+13. The user should be able to speak naturally in shorthand relative to the active workout context, for example `done`, `add 5 lbs`, `swap this`, or `too hard`, without restating the full exercise context.
+14. The design goal is to make working out feel like following a real trainer: the user sees what matters now, responds naturally, and does not manage software complexity.
+
+In plain product terms, the application should look like a simple chat screen with a persistent workout tray near the bottom. Most of the screen is the conversation feed, where the trainer talks naturally and prior messages recede upward into history. During a workout, the current exercise or rest state remains persistently accessible in a compact tray above the input dock. That tray shows the current workout state, a short progress line, and one obvious action such as `complete`, `start`, or `continue`.
+
+When the user taps the tray, the tray itself should expand upward in place and fill with more detail and actions. It is not a separate modal or bottom sheet that covers the voice/text dock. The input dock must remain visible and anchored below the tray while the tray grows upward. In its expanded state, the tray reveals more information about the current exercise, such as target reps or weight, a short coaching cue, and a small set of additional actions like `skip`, `swap`, or `make it easier`.
+
+The overall effect should feel like one calm coaching surface: the chat handles the relationship and guidance, inline feed components handle contextual information, the persistent workout tray handles the current live workout action, and the input dock remains continuously available for natural voice or text interaction.
 
 ---
 
@@ -165,6 +178,7 @@ FUNCTION admit_request(ctx: RequestContext) -> AdmissionDecision:
 | `agent_runtime_module` | context assembly + model/tool loop | worker handlers |
 | `provider_adapter_module` | provider-specific request/stream/tool adaptations behind a stable runtime contract | adapter interfaces |
 | `feed_contract_module` | typed message and inline-component payload contracts for the client feed | API schemas |
+| `bff_module` | aggregate frontend-ready view models and feed payloads so clients do not orchestrate many backend calls | API view-model services |
 | `memory_module` | MEMORY/PROGRAM/DAILY docs + versions | memory services |
 | `indexing_module` | extract/redact/chunk/embed/upsert | worker handlers |
 | `retrieval_module` | hybrid vector + FTS search | retrieval API |
@@ -176,8 +190,71 @@ FUNCTION admit_request(ctx: RequestContext) -> AdmissionDecision:
 ### 3.2 Module Dependency Direction
 
 1. API gateway may call session, transcript, policy, queue.
-2. Workers may call session, transcript, memory, indexing, retrieval, delivery, safety, policy.
-3. Lower-level modules must not depend on API transport details.
+2. API gateway and BFF module may call session, transcript, memory, retrieval, delivery, and policy to assemble client-ready payloads.
+3. Workers may call session, transcript, memory, indexing, retrieval, delivery, safety, policy.
+4. Lower-level modules must not depend on API transport details.
+
+### 3.3 Backend-for-Frontend Aggregation Contract
+
+1. The backend must provide frontend-ready aggregated payloads so the client does not need to orchestrate many independent requests to render the primary coach surface.
+2. BFF aggregation may compose session state, active run state, feed items, current workout, current exercise, timers, and lightweight memory/profile summaries into a single view model.
+3. Aggregated client payloads must be derived from canonical Postgres state, with Redis used only as an acceleration layer for cacheable reads.
+4. BFF aggregation must not create alternate business truth; it is a read-model layer over canonical state.
+5. The client feed contract should prefer one ordered response payload over many chat-adjacent support requests.
+
+```pseudocode
+FUNCTION build_coach_surface(user_id: String, session_key: String) -> CoachSurfaceView:
+    session_state = load_session_state(session_key)
+    active_run = load_active_run(user_id, session_key)
+    feed_items = load_recent_feed_items(session_key)
+    workout_state = load_current_workout_state(user_id, session_key)
+    quick_stats = load_quick_stats_summary(user_id)
+
+    RETURN CoachSurfaceView(
+        session=session_state,
+        run=active_run,
+        feed=feed_items,
+        workout=workout_state,
+        quick_stats=quick_stats,
+    )
+```
+
+### 3.4 Agentic Semantic Error Handling and Recovery
+
+1. Tool execution and domain actions must handle semantic mistakes explicitly, not only transport or type errors.
+2. When a tool call is syntactically valid but semantically wrong for the current workout, program, safety state, or memory state, the runtime must return a structured semantic error result.
+3. Structured semantic error results must include:
+4. stable machine-readable error code,
+5. human-readable explanation,
+6. actionable corrective guidance for the agent,
+7. optional suggested constraints, alternatives, or valid next steps.
+8. The runtime should pass semantic error results back into the model loop so the agent can recover and continue rather than collapsing the run immediately.
+9. Semantic error events must be logged and auditable so prompts, tool contracts, and guardrails can be improved over time.
+10. Repeated semantic failures within one run may trigger escalation or safe fallback according to policy.
+
+```pseudocode
+RECORD SemanticToolError:
+    code                : String
+    explanation         : String
+    agent_guidance      : String
+    suggested_fix       : Dict | None
+    retryable_in_run    : Boolean
+
+FUNCTION execute_tool_with_recovery(call: ToolCall) -> ToolResult:
+    validation = validate_tool_call(call)
+    IF validation.status == "semantic_error":
+        error = SemanticToolError(
+            code=validation.code,
+            explanation=validation.explanation,
+            agent_guidance=validation.agent_guidance,
+            suggested_fix=validation.suggested_fix,
+            retryable_in_run=true,
+        )
+        append_semantic_error_event(call, error)
+        RETURN ToolResult(status="semantic_error", error=error)
+
+    RETURN execute_tool(call)
+```
 
 ---
 
@@ -625,15 +702,124 @@ Policy hierarchy:
 
 ---
 
-## 12. Provider Adapter Architecture
+## 12. Prompt Layers and Lifecycle
 
-### 12.1 Goal and Scope
+### 12.1 Purpose
+
+The trainer should feel coherent, relational, and stable over time. That effect must come from explicit prompt layers and durable memory, not from hoping the model improvises the right personality on each run.
+
+The implementation must separate:
+
+1. app-owned runtime behavior,
+2. trainer identity and tone,
+3. trainer operating principles,
+4. structured program state,
+5. evolving user memory.
+
+### 12.2 Prompt Layer Model
+
+The system must use the following logical prompt layers.
+
+| Layer | Scope | Ownership | Change Frequency | Purpose |
+| --- | --- | --- | --- | --- |
+| `system_prompt` | app-wide | product/runtime | rare | runtime rules, safety, tool usage, memory recall, delivery behavior, and trainer operating behavior |
+| `coach_principles` | app-wide | product/coaching design | occasional | exercise design principles, progression rules, safety heuristics, coaching standards |
+| `coach_soul` | per user | user-selected from curated options, then user-owned | rare | trainer identity, tone, relational stance, motivational style |
+| `program_markdown` | per user | agent + system | ongoing | structured current training program and progression state |
+| `memory_markdown` | per user | user + agent | ongoing | durable learned facts, recurring patterns, relational preferences |
+| `episodic_notes` | per user | agent + system flushes | frequent/opportunistic | date-keyed notes from meaningful days or compaction/session-end flushes |
+
+### 12.3 Layer Semantics
+
+1. `system_prompt` is the runtime contract and must remain app-owned.
+2. `coach_principles` is the domain guidance layer and should encode good coaching, exercise selection, progression, recovery, and safety principles.
+3. `coach_soul` is the closest equivalent to OpenClaw's `SOUL.md`, but it is stored in the database as Markdown text and scoped per user.
+4. `coach_soul` should make the trainer feel like a real person with a stable tone and relationship stance.
+5. Trainer operating behavior that would otherwise live in a separate playbook should be part of `system_prompt`; the implementation should not maintain a separate `coach_playbook` layer.
+6. `program_markdown` stores the user's current training program in structured Markdown and is updated over time as progress is made.
+7. `memory_markdown` stores onboarding facts, preferences, injuries, equipment context, and other durable learned knowledge about the user.
+8. `memory_markdown` and `episodic_notes` are the evolving continuity layers and should carry personalization over time.
+9. The model must not freely rewrite `system_prompt` or `coach_principles` during normal operation.
+
+### 12.4 Bootstrap and Onboarding Lifecycle
+
+1. A new user should go through a bootstrap interview run rather than a static form-only setup.
+2. The bootstrap interview should feel like a real trainer intake conversation.
+3. The bootstrap prompt should instruct the trainer to ask about:
+4. goals,
+5. workout history and training age,
+6. current routine,
+7. injuries, pain, or medical constraints,
+8. available equipment and workout locations,
+9. schedule and lifestyle constraints,
+10. motivation style and coaching preferences.
+11. Responses from this bootstrap flow should be written into `memory_markdown`.
+12. The user should choose or confirm a `coach_soul` at startup.
+13. The bootstrap flow may also seed an initial `program_markdown` when enough training information is available.
+14. Once onboarding is complete, bootstrap prompts should no longer run on every normal turn.
+
+```pseudocode
+FUNCTION run_bootstrap_interview(user_id: String) -> BootstrapResult:
+    soul = select_or_confirm_coach_soul(user_id)
+    interview = conduct_bootstrap_conversation(user_id, soul)
+    memory_md = synthesize_memory_markdown(interview.answers)
+    save_memory_markdown(user_id, memory_md)
+    seed_initial_program(user_id, interview.answers)
+    mark_bootstrap_complete(user_id)
+    RETURN BootstrapResult(status="completed", coach_soul=soul)
+```
+
+### 12.5 Prompt Assembly Contract
+
+At run time, prompt assembly should layer stable and evolving context in this order:
+
+1. `system_prompt`
+2. `coach_principles`
+3. `coach_soul`
+4. `program_markdown`
+5. recent session/retrieval context
+6. recalled `memory_markdown` / `episodic_notes` snippets as needed
+
+Rules:
+
+1. Stable layers should change slowly so the trainer remains coherent.
+2. Evolving memory layers should personalize behavior without causing trainer identity drift.
+3. `coach_soul` must be loaded every run for that user so the trainer feels like the same person over time.
+4. `program_markdown` should be lightweight enough to inject directly or cheaply hydrate on every run.
+5. Large evolving memory should be retrieved on demand rather than blindly injected in full.
+
+### 12.6 Update Rules
+
+1. `system_prompt` may only be changed by application deploy/config revision.
+2. `coach_principles` may only be changed by curated product/coaching updates.
+3. `coach_soul` may be selected at onboarding and later changed intentionally by the user.
+4. `program_markdown` may be updated by the agent over time as progress is made, workouts are completed, and the plan evolves.
+5. `memory_markdown` may be updated from onboarding, explicit user edits, or high-confidence structured agent updates.
+6. `memory_markdown` may be updated when the user says to remember something or when the agent determines a durable preference/pattern should be stored.
+7. `episodic_notes` may be created only when something meaningful happened or when a pre-compaction/session-end flush writes them.
+
+### 12.7 Why This Produces a Human Feel
+
+The trainer should feel human because:
+
+1. identity is stable (`coach_soul`),
+2. behavior is disciplined (`system_prompt` + `coach_principles`),
+3. the user is known through durable memory (`memory_markdown`),
+4. history accumulates (`memory_markdown` + `episodic_notes`).
+
+This mirrors the useful OpenClaw pattern: stable persona plus evolving continuity, rather than letting all personality emerge from chat history alone.
+
+---
+
+## 13. Provider Adapter Architecture
+
+### 13.1 Goal and Scope
 
 1. Provider portability is in scope and required for the first architecture pass.
 2. The implementation must support OpenAI, Anthropic, and Gemini through a stable runtime contract.
 3. The core architecture (sessions, queueing, memory, indexing, retrieval, delivery) must not change when switching providers.
 
-### 12.2 Adapter Layer Contract
+### 13.2 Adapter Layer Contract
 
 The adapter layer must isolate provider differences in five areas:
 
@@ -643,7 +829,7 @@ The adapter layer must isolate provider differences in five areas:
 4. stream event normalization,
 5. provider error classification and retryability.
 
-### 12.3 Pseudocode Interfaces
+### 13.3 Pseudocode Interfaces
 
 ```pseudocode
 INTERFACE ProviderAdapter:
@@ -666,7 +852,7 @@ INTERFACE OutputNormalizationAdapter:
     FUNCTION normalize(provider_output: Any) -> NormalizedOutput
 ```
 
-### 12.4 Provider Capability Registry
+### 13.4 Provider Capability Registry
 
 The implementation must keep a provider/model capability registry used by `agent_runtime_module` and adapters.
 
@@ -680,7 +866,7 @@ The implementation must keep a provider/model capability registry used by `agent
 | `max_context_tokens` | `Integer` | none | hard context limit used in runtime checks |
 | `stream_protocol` | `String` | none | provider streaming shape classification |
 
-### 12.5 Runtime Flow with Adapters
+### 13.5 Runtime Flow with Adapters
 
 ```pseudocode
 FUNCTION run_agent_turn(run_input: RuntimeInput) -> RunResult:
@@ -706,7 +892,7 @@ FUNCTION run_agent_turn(run_input: RuntimeInput) -> RunResult:
     RETURN output_normalization_adapter.normalize(provider_stream.final_output())
 ```
 
-### 12.6 Non-Negotiable Invariants
+### 13.6 Non-Negotiable Invariants
 
 1. Switching provider must not require schema changes in session, memory, or indexing tables.
 2. Switching provider must preserve transcript append contracts and session concurrency behavior.
@@ -715,7 +901,7 @@ FUNCTION run_agent_turn(run_input: RuntimeInput) -> RunResult:
 
 ---
 
-## 13. Out of Scope (Current Version)
+## 14. Out of Scope (Current Version)
 
 **Real-time collaborative multi-user program editing.** Concurrent multi-author real-time editing of `PROGRAM` is out of scope. Extension point: OT/CRDT collaboration layer on top of `memory_doc_versions`.
 
@@ -727,7 +913,7 @@ FUNCTION run_agent_turn(run_input: RuntimeInput) -> RunResult:
 
 ---
 
-## 14. Open Questions Requiring Clarification
+## 15. Open Questions Requiring Clarification
 
 1. Should `sessionId` day-boundary rotation be enabled by default, or only idle/manual reset for v1 rollout?
 2. For daily memory reads at new-session start, should default be `today_and_yesterday` or `current_week`?
@@ -740,11 +926,12 @@ FUNCTION run_agent_turn(run_input: RuntimeInput) -> RunResult:
 
 ---
 
-## 15. Definition of Done
+## 16. Definition of Done
 
-### 15.1 API Gateway and Session Resolve
+### 16.1 API Gateway and Session Resolve
 
 - [ ]  API validates auth, schema, and idempotency before mutation.
+- [ ]  API rejects malformed request bodies, invalid ownership, invalid component actions, and malformed SSE resume cursors before enqueueing work.
 - [ ]  API resolves canonical `sessionKey` and active `sessionId` for each inbound action.
 - [ ]  API persists inbound event and enqueues worker jobs in one request flow.
 - [ ]  API returns deterministic `202 Accepted` with `sessionKey`, `runId`, `jobId`, and stream URL.
@@ -752,14 +939,15 @@ FUNCTION run_agent_turn(run_input: RuntimeInput) -> RunResult:
 - [ ]  API gateway enforces active-run and active-stream concurrency limits per effective user policy.
 - [ ]  `429` responses include structured retry metadata and limit scope.
 
-### 15.2 Transcript and Event Model
+### 16.2 Transcript and Event Model
 
 - [ ]  `session_events` is append-only and immutable after insert.
 - [ ]  Parent linkage is enforced and leaf pointer advances atomically.
 - [ ]  Event catalog supports `context_includable`, `indexable`, and `audit_only` flags.
 - [ ]  Workout, program, memory, safety, and system event families are implemented.
+- [ ]  Semantic tool failures are recorded as explicit structured events with agent-facing guidance.
 
-### 15.3 Queue, Workers, and Concurrency
+### 16.3 Queue, Workers, and Concurrency
 
 - [ ]  BullMQ jobs in Redis are durable enough for restart/recovery under configured persistence/HA policy.
 - [ ]  Per-session advisory locks prevent concurrent mutation of same session.
@@ -768,14 +956,14 @@ FUNCTION run_agent_turn(run_input: RuntimeInput) -> RunResult:
 - [ ]  Failed jobs are observable and routed to dead-letter handling.
 - [ ]  Queue state is recoverable without data loss because canonical outcomes remain in Postgres.
 
-### 15.4 Memory and Document Lifecycle
+### 16.4 Memory and Document Lifecycle
 
 - [ ]  `MEMORY`, `PROGRAM`, and `DAILY` docs exist as versioned DB records.
 - [ ]  Pre-compaction and session-end flush paths can create/update daily docs.
 - [ ]  New-session memory reads follow configured window policy.
 - [ ]  Memory writes are attributable to actor and run/session provenance.
 
-### 15.5 Indexing and Retrieval
+### 16.5 Indexing and Retrieval
 
 - [ ]  Dirty tracking with delta thresholds gates indexing work.
 - [ ]  Session indexing extracts, redacts, chunks, embeds, and upserts with provenance.
@@ -784,7 +972,7 @@ FUNCTION run_agent_turn(run_input: RuntimeInput) -> RunResult:
 - [ ]  Retrieval can be stale only within async sync window, with visible watermark metrics.
 - [ ]  Full Redis index rebuild from Postgres is supported and documented.
 
-### 15.6 Delivery and Streaming
+### 16.6 Delivery and Streaming
 
 - [ ]  Streaming emits lifecycle and delta events during run execution.
 - [ ]  SSE reconnect supports resume via `Last-Event-ID` or `since` cursor.
@@ -794,7 +982,24 @@ FUNCTION run_agent_turn(run_input: RuntimeInput) -> RunResult:
 - [ ]  Outbox retries transient failures and records terminal failures.
 - [ ]  Duplicate final deliveries are prevented by idempotency constraints.
 
-### 15.7 Policy, Cost, and Safety Enforcement
+### 16.7 Client View Aggregation and UX Contract
+
+- [ ]  The primary coach screen is driven by one aggregated backend payload rather than many client-side orchestration requests.
+- [ ]  Aggregated client payloads combine canonical session/run/workout/feed state without creating alternate business truth.
+- [ ]  The UI contract includes a persistent bottom dock with text entry, microphone control, and live transcript behavior.
+- [ ]  The workout tray expands upward in place above the input dock and does not cover or replace the persistent input dock.
+- [ ]  During workout-active states, the current exercise or rest state is controlled through the persistent workout tray, while inline feed UI remains reserved for contextual and reflective components.
+
+### 16.8 Prompt Layers and Bootstrap Lifecycle
+
+- [ ]  Prompt assembly separates runtime rules, coaching principles, coach identity, structured program state, and evolving memory into distinct layers.
+- [ ]  `coach_soul` is stored per user as Markdown text and loaded on every run for that user.
+- [ ]  New users go through a bootstrap interview flow that populates `memory_markdown`.
+- [ ]  Bootstrap interview covers goals, training history, injuries/constraints, equipment, schedule, and coaching preferences.
+- [ ]  `system_prompt` and `coach_principles` remain curated and are not freely rewritten during normal operation.
+- [ ]  Evolving personalization is stored in `memory_markdown` and `episodic_notes`, while training structure evolves in `program_markdown`, instead of drifting the trainer identity layer.
+
+### 16.9 Policy, Cost, and Safety Enforcement
 
 - [ ]  Effective policy resolution merges global, plan, and user overrides.
 - [ ]  Plan-tier knobs control indexing, retrieval, sources, and embedding budget.
@@ -803,7 +1008,7 @@ FUNCTION run_agent_turn(run_input: RuntimeInput) -> RunResult:
 - [ ]  Safety signals trigger deterministic escalation/constraint behavior.
 - [ ]  All policy, safety, and redaction decisions are auditable.
 
-### 15.8 Provider Adapter Portability
+### 16.10 Provider Adapter Portability
 
 - [ ]  Provider adapter layer supports OpenAI, Anthropic, and Gemini via one stable runtime contract.
 - [ ]  Transcript hygiene is provider-aware and deterministic before each model run.
@@ -812,7 +1017,7 @@ FUNCTION run_agent_turn(run_input: RuntimeInput) -> RunResult:
 - [ ]  Provider errors map to stable retryable/non-retryable/internal classes.
 - [ ]  Switching providers requires no changes to session, memory, indexing, or retrieval schemas.
 
-### 15.9 Cross-Feature Parity Matrix
+### 16.11 Cross-Feature Parity Matrix
 
 | Test Case | OpenAI | Anthropic | Gemini | Memory-Only Plan | Premium Hybrid Plan |
 | --- | --- | --- | --- | --- | --- |
@@ -824,17 +1029,25 @@ FUNCTION run_agent_turn(run_input: RuntimeInput) -> RunResult:
 | Final delivery survives stream disconnect | [ ] | [ ] | [ ] | [ ] | [ ] |
 | SSE reconnect replays missed events and resumes live | [ ] | [ ] | [ ] | [ ] | [ ] |
 | Rate limiting returns structured `429` with retry metadata | [ ] | [ ] | [ ] | [ ] | [ ] |
+| Bootstrap flow seeds memory, program, and stable coach soul | [ ] | [ ] | [ ] | [ ] | [ ] |
+| Semantic tool errors recover within run with structured guidance | [ ] | [ ] | [ ] | [ ] | [ ] |
 | Budget limit blocks embedding with graceful degradation | [ ] | [ ] | [ ] | [ ] | [ ] |
 | Safety escalation path emits safety events | [ ] | [ ] | [ ] | [ ] | [ ] |
 | Canonical tool definitions execute through adapter mappings | [ ] | [ ] | [ ] | [ ] | [ ] |
 
-### 15.10 Integration Smoke Test
+### 16.12 Integration Smoke Test
 
 ```
 -- Setup
 user_id = "u_123"
 policy = load_effective_policy(user_id)
 ASSERT policy is not NONE
+
+-- Bootstrap
+bootstrap = run_bootstrap_interview(user_id)
+ASSERT bootstrap.status == "completed"
+ASSERT bootstrap.coach_soul is not NONE
+ASSERT load_memory_markdown(user_id) is not NONE
 
 -- Inbound action
 resp = POST /messages { user_id, text="Completed squat set 225x5 RPE 8", idempotency_key="k1" }
@@ -843,11 +1056,22 @@ ASSERT resp.session_key == "user:u_123:main"
 ASSERT resp.job_id is not NONE
 ASSERT resp.stream_url is not NONE
 
+-- Gateway validation
+bad = POST /messages { user_id, component_action={ type="bad_action" } }
+ASSERT bad.status >= 400
+ASSERT bad.status < 500
+
 -- Rate limiting metadata
 limited = POST /messages { user_id, text="spam", idempotency_key="k-limit" } after exhausting bucket
 ASSERT limited.status == 429
 ASSERT limited.error.scope is not NONE
 ASSERT limited.error.retry_after_seconds > 0
+
+-- BFF payload
+surface = GET /coach-surface { user_id }
+ASSERT surface.status == 200
+ASSERT surface.payload.feed is not NONE
+ASSERT surface.payload.workout is not NONE OR surface.payload.run is not NONE
 
 -- Worker run and lock behavior
 job = dequeue("agent.run_turn")
@@ -858,6 +1082,11 @@ ASSERT lock_ok == true
 -- Transcript append
 event = append_session_event(...)
 ASSERT event.event_type == "conversation.user_message" OR event.event_type == "workout.set.completed"
+
+-- Semantic tool recovery
+tool_result = execute_tool_with_recovery(invalid_semantic_adjustment_call)
+ASSERT tool_result.status == "semantic_error"
+ASSERT tool_result.error.agent_guidance is not NONE
 
 -- Flush + memory write
 flush_job = enqueue("memory.flush_session_end", { session_key: job.session_key })

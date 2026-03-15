@@ -180,6 +180,8 @@ The overall effect should feel like one calm coaching surface: the chat handles 
 | `feed_contract_module` | typed message and inline-component payload contracts for the client feed | API schemas |
 | `bff_module` | aggregate frontend-ready view models and feed payloads so clients do not orchestrate many backend calls | API view-model services |
 | `memory_module` | MEMORY/PROGRAM/DAILY docs + versions | memory services |
+| `trainer_tools_module` | typed trainer action catalog and execution handlers | tool registry + handlers |
+| `workout_module` | live workout state, exercise progression, and tray-backed current action state | workout services |
 | `indexing_module` | extract/redact/chunk/embed/upsert | worker handlers |
 | `retrieval_module` | hybrid vector + FTS search | retrieval API |
 | `delivery_module` | streaming + durable final delivery | SSE + outbox |
@@ -254,6 +256,105 @@ FUNCTION execute_tool_with_recovery(call: ToolCall) -> ToolResult:
         RETURN ToolResult(status="semantic_error", error=error)
 
     RETURN execute_tool(call)
+```
+
+### 3.5 Trainer Tool Registry
+
+The trainer must act through an explicit typed tool catalog rather than vague free-form "do something" behavior.
+
+#### 3.5.1 Tool Categories
+
+The core tool registry should include these categories:
+
+1. context and memory recall,
+2. workout execution,
+3. live workout adjustment,
+4. program management,
+5. coaching calculations and decision support,
+6. memory and episodic-note writes.
+
+#### 3.5.2 Core Tool Definitions
+
+| Tool | Category | Mutating | Purpose |
+| --- | --- | --- | --- |
+| `memory_search` | context | `false` | semantically search durable memory and episodic notes |
+| `memory_get` | context | `false` | fetch current `memory_markdown` content |
+| `program_get` | context | `false` | load current `program_markdown` |
+| `get_recent_workout_history` | context | `false` | load recent workout performance/history |
+| `get_user_readiness` | context | `false` | load readiness/recovery signals |
+| `workout_generate` | workout execution | `true` | generate a workout session structure when the user is ready to train |
+| `workout_get_current_state` | workout execution | `false` | load the current live workout/tray state |
+| `workout_start_session` | workout execution | `true` | mark the workout session active |
+| `workout_complete_set` | workout execution | `true` | complete the current set and update progression state |
+| `workout_complete_exercise` | workout execution | `true` | mark current exercise complete |
+| `workout_skip_exercise` | workout execution | `true` | skip current exercise |
+| `workout_start_rest` | workout execution | `true` | begin rest state for the active exercise |
+| `workout_end_rest` | workout execution | `true` | end rest state and advance flow |
+| `workout_finish_session` | workout execution | `true` | mark session finished and emit summary events |
+| `workout_adjust_load` | live adjustment | `true` | change current or remaining load targets |
+| `workout_adjust_reps` | live adjustment | `true` | change current or remaining rep targets |
+| `workout_adjust_duration` | live adjustment | `true` | change current or remaining duration targets |
+| `workout_swap_exercise` | live adjustment | `true` | replace the current exercise with a valid substitute |
+| `workout_mark_too_hard` | live adjustment | `true` | record difficulty signal and trigger adaptation |
+| `workout_mark_pain_flag` | live adjustment | `true` | record safety/pain signal and constrain future actions |
+| `document_replace_text` | document mutation | `true` | replace a specific text span inside `memory_markdown` or `program_markdown` |
+| `document_replace_entire` | document mutation | `true` | replace the full contents of `memory_markdown` or `program_markdown` |
+| `program_adjust_progression` | program | `true` | progress/regress future training prescription |
+| `calculate_estimated_1rm` | decision support | `false` | compute estimated 1RM from performance data |
+| `suggest_exercise_substitution` | decision support | `false` | find context-appropriate replacement movements |
+| `evaluate_readiness_adjustment` | decision support | `false` | suggest intensity or volume modifications |
+| `episodic_note_append` | memory write | `true` | append a date-keyed episodic note |
+
+#### 3.5.3 Tool Execution Rules
+
+1. The model must choose from canonical internal tools, not invent tool names.
+2. Read-only tools should be preferred before mutating tools when additional context is needed.
+3. Mutating tools must validate workout/program/session state before applying changes.
+4. Every mutating tool call must append auditable `tool.*` and domain events.
+5. Tool outputs must be shaped so the agent can continue the run without guessing hidden side effects.
+
+#### 3.5.3.1 DB-Backed Markdown Document Mutation Tools
+
+The system should treat user-facing memory and program documents as versioned Markdown stored in Postgres, not as workspace files.
+
+The canonical document-mutation tools are:
+
+| Tool | Required Inputs | Behavior |
+| --- | --- | --- |
+| `document_replace_text` | `doc_key`, `old_text`, `new_text`, `expected_version`, `reason` | perform a targeted text replacement against the current Markdown version and write a new version on success |
+| `document_replace_entire` | `doc_key`, `markdown`, `expected_version`, `reason` | replace the entire Markdown document and write a new version |
+| `episodic_note_append` | `date_key`, `markdown_block`, `reason` | append a Markdown block to the date-keyed episodic note for that date |
+
+These tools should follow these rules:
+
+1. `memory_get` and `program_get` are the read path for durable Markdown documents.
+2. `document_replace_text` is the preferred targeted-edit path for `memory_markdown` and `program_markdown`.
+3. `document_replace_entire` is the preferred full-rewrite path for `memory_markdown` and `program_markdown`.
+4. `episodic_note_append` is append-only and should be used for flushes, notes, and time-based episodic writes.
+5. All document mutation tools must enforce optimistic concurrency through `expected_version`.
+6. All document mutation tools must create new document versions rather than mutating rows in place.
+7. The system must not expose patch-style document editing as part of the core document tool contract.
+
+#### 3.5.4 Live Workout Generation
+
+1. The workout session should be generated when the user indicates they are ready to work out.
+2. Natural-language triggers such as "I'm ready", "start workout", or similar tray actions may lead the agent to call `workout_generate`.
+3. `workout_generate` should accept guidance context such as readiness, time available, pain constraints, equipment, and current program state.
+4. `workout_generate` returns a workout session structure that becomes the source of truth for the persistent workout tray.
+5. After generation, the agent should be notified of the generated structure so it can coach the user through the workout conversationally.
+
+```pseudocode
+FUNCTION handle_user_ready_to_work_out(user_id: String, guidance: Dict) -> WorkoutSessionState:
+    current_program = program_get(user_id)
+    readiness = get_user_readiness(user_id)
+    workout = workout_generate(
+        user_id=user_id,
+        program=current_program,
+        readiness=readiness,
+        guidance=guidance,
+    )
+    notify_agent_workout_generated(user_id, workout)
+    RETURN workout
 ```
 
 ---
@@ -343,7 +444,152 @@ RECORD SessionEvent:
     occurred_at        : Timestamp
     recorded_at        : Timestamp
     idempotency_key    : String | None
+
+RECORD ExerciseDefinition:
+    exercise_id            : String
+    slug                   : String
+    name                   : String
+    category               : String
+    movement_pattern       : String
+    primary_muscles        : List<String>
+    secondary_muscles      : List<String>
+    equipment_required     : List<String>
+    equipment_optional     : List<String>
+    difficulty             : String
+    unilateral             : Boolean
+    default_tracking_mode  : String
+    contraindications      : List<String>
+    coaching_cues          : List<String>
+    regression_ids         : List<String>
+    progression_ids        : List<String>
+    substitution_tags      : List<String>
+
+RECORD ProgramSetTarget:
+    set_index              : Integer
+    target_reps            : Integer | None
+    rep_range_min          : Integer | None
+    rep_range_max          : Integer | None
+    target_load            : Float | None
+    target_duration_sec    : Integer | None
+    target_distance_m      : Integer | None
+    target_rpe             : Float | None
+
+RECORD ProgramExercise:
+    program_exercise_id    : String
+    exercise_id            : String
+    block_id               : String
+    day_key                : String
+    order_index            : Integer
+    prescription_type      : String
+    sets                   : List<ProgramSetTarget>
+    rest_seconds           : Integer | None
+    tempo                  : String | None
+    intensity_type         : String | None
+    notes                  : String | None
+    progression_rule       : Dict | None
+
+RECORD WorkoutSetState:
+    set_index              : Integer
+    status                 : String
+    prescribed_reps        : Integer | None
+    prescribed_load        : Float | None
+    prescribed_duration_sec: Integer | None
+    prescribed_distance_m  : Integer | None
+    prescribed_rpe         : Float | None
+    actual_reps            : Integer | None
+    actual_load            : Float | None
+    actual_duration_sec    : Integer | None
+    actual_distance_m      : Integer | None
+    actual_rpe             : Float | None
+    started_at             : Timestamp | None
+    completed_at           : Timestamp | None
+    notes                  : String | None
+
+RECORD WorkoutAdjustment:
+    adjustment_id          : String
+    type                   : String
+    source                 : String
+    reason                 : String | None
+    before                 : Dict | None
+    after                  : Dict | None
+    created_at             : Timestamp
+
+RECORD WorkoutExerciseState:
+    workout_exercise_id    : String
+    workout_session_id     : String
+    program_exercise_id    : String | None
+    exercise_id            : String
+    status                 : String
+    order_index            : Integer
+    started_at             : Timestamp | None
+    completed_at           : Timestamp | None
+    current_set_index      : Integer | None
+    prescribed             : Dict
+    sets                   : List<WorkoutSetState>
+    active_rest            : Dict | None
+    adjustments            : List<WorkoutAdjustment>
+    coach_message          : String | None
+
+RECORD WorkoutSessionState:
+    workout_session_id     : String
+    user_id                : String
+    status                 : String
+    started_at             : Timestamp
+    completed_at           : Timestamp | None
+    current_exercise_index : Integer | None
+    current_exercise_id    : String | None
+    current_phase          : String
+    exercises              : List<WorkoutExerciseState>
+    summary                : Dict
 ```
+
+### 4.4 Workout and Exercise State Model
+
+The system must separate:
+
+1. exercise library definitions,
+2. program prescriptions,
+3. live workout execution state.
+
+#### 4.4.1 Exercise Definition Layer
+
+`ExerciseDefinition` is the canonical movement-library entry. It should describe what the movement is, how it is tracked, what equipment it requires, and what substitutions or regressions are valid.
+
+This layer should be stable reference data and should not be mutated by live workout execution.
+
+#### 4.4.2 Program Prescription Layer
+
+`ProgramExercise` stores how a movement is prescribed for the user within the current program.
+
+This layer represents plan intent:
+
+1. order in the session,
+2. sets/reps/load/duration targets,
+3. rest/tempo/intensity guidance,
+4. progression rules.
+
+This layer may evolve as the agent updates `program_markdown`.
+
+#### 4.4.3 Live Workout Execution Layer
+
+`WorkoutSessionState` and `WorkoutExerciseState` represent what is happening right now in the active workout.
+
+This layer is what the persistent workout tray should read from and what live workout tools should modify.
+
+It must support:
+
+1. current exercise pointer,
+2. current phase (`exercise`, `rest`, `transition`, `finished`),
+3. performed set state,
+4. live adjustments,
+5. coach cues for the tray.
+
+#### 4.4.4 Tool Interaction Contract
+
+1. `workout_adjust_*` tools should mutate live workout state, not the exercise library.
+2. `program_*` tools should mutate `program_markdown` and future training prescription, not rewrite completed workout history.
+3. `workout_complete_set` and related tools should update `WorkoutSetState` and advance live workout flow.
+4. The workout tray should be backed by `WorkoutSessionState.current_phase`, the current `WorkoutExerciseState`, and the current `WorkoutSetState`.
 
 ---
 
@@ -628,6 +874,94 @@ FUNCTION finalize_run_delivery(run_id: String, final_payload: Dict):
     persist_final_run_state(run_id, final_payload)
     insert_delivery_outbox(run_id, final_payload, status="queued")
 ```
+
+### 9.5 Heartbeat and Proactive Coaching
+
+Heartbeat is the proactive coach-awareness loop. It is distinct from cron-style scheduled jobs and is intended to decide whether the coach should surface something meaningful to the user.
+
+#### 9.5.1 Heartbeat Purpose
+
+1. Heartbeat should run as a periodic per-user proactive coach turn in the user's main trainer relationship context.
+2. Heartbeat should be used for awareness, follow-up, gentle nudges, and timely coach messages.
+3. Heartbeat should not be used for precise scheduling, heavy background analysis, or exact-time reminders.
+4. The implementation should prefer silence when no meaningful proactive message is warranted.
+
+#### 9.5.2 Pre-Run Gating
+
+The system must apply deterministic gating before making a heartbeat LLM call.
+
+Pre-run gating should consider at least:
+
+1. whether the user has heartbeat/proactive coaching enabled,
+2. active hours / quiet hours,
+3. recent user interaction recency,
+4. whether the user is in an active workout or active run,
+5. recent proactive message cooldown windows,
+6. whether any candidate reason exists to speak.
+
+If no candidate reason exists, or if policy says the coach should remain quiet, the heartbeat run should be skipped before calling the model.
+
+#### 9.5.3 Heartbeat Result Contract
+
+Heartbeat runs must return one of these logical outcomes:
+
+1. `HEARTBEAT_OK`
+2. `THREAD_ONLY`
+3. `THREAD_PLUS_PUSH`
+
+Meaning:
+
+1. `HEARTBEAT_OK` means nothing important or timely should be surfaced to the user.
+2. `THREAD_ONLY` means a proactive coach message should be appended to the user's thread, but no push notification should be sent.
+3. `THREAD_PLUS_PUSH` means a proactive coach message should be appended to the user's thread and is recommended for push delivery.
+
+The prompt should strongly bias toward `HEARTBEAT_OK` unless there is a meaningful reason to speak.
+
+#### 9.5.4 Server-Controlled Delivery Enforcement
+
+1. The model may recommend `THREAD_ONLY` or `THREAD_PLUS_PUSH`, but the server remains the final authority on delivery behavior.
+2. The server may downgrade `THREAD_PLUS_PUSH` to `THREAD_ONLY` based on:
+3. quiet hours,
+4. user push-notification settings,
+5. recent notification fatigue/cooldowns,
+6. active-session recency,
+7. other safety or policy rules.
+8. If push is disabled for the user, the system may still run heartbeat and append a message to the thread when appropriate, but it must not send a push notification.
+9. If the entire proactive feature is disabled for the user, the system must skip heartbeat runs entirely.
+
+```pseudocode
+FUNCTION should_run_heartbeat(user_id: String, now: Timestamp) -> Boolean:
+    prefs = load_proactive_preferences(user_id)
+    IF NOT prefs.heartbeat_enabled:
+        RETURN false
+    IF is_quiet_hours(user_id, now):
+        RETURN false
+    IF has_active_run(user_id) OR has_active_workout(user_id):
+        RETURN false
+    IF recently_interacted(user_id):
+        RETURN false
+    IF NOT has_candidate_heartbeat_reason(user_id, now):
+        RETURN false
+    RETURN true
+
+FUNCTION enforce_heartbeat_delivery(user_id: String, recommendation: String) -> String:
+    prefs = load_proactive_preferences(user_id)
+    IF recommendation == "THREAD_PLUS_PUSH":
+        IF NOT prefs.push_enabled:
+            RETURN "THREAD_ONLY"
+        IF is_quiet_hours(user_id, NOW()):
+            RETURN "THREAD_ONLY"
+        IF in_notification_cooldown(user_id):
+            RETURN "THREAD_ONLY"
+    RETURN recommendation
+```
+
+#### 9.5.5 UI Treatment of Proactive Messages
+
+1. Proactive coach messages added while the user is away must appear in the main thread, not in a separate inbox surface.
+2. The client UI must visually indicate that a proactive message arrived while the user was away.
+3. This indication may be implemented with unread separators, unseen state, or a lightweight "while you were away" treatment.
+4. Proactive messages should feel like part of the same coach relationship, not like system alerts from a separate subsystem.
 
 ---
 
@@ -962,6 +1296,7 @@ FUNCTION run_agent_turn(run_input: RuntimeInput) -> RunResult:
 - [ ]  Pre-compaction and session-end flush paths can create/update daily docs.
 - [ ]  New-session memory reads follow configured window policy.
 - [ ]  Memory writes are attributable to actor and run/session provenance.
+- [ ]  `program_markdown` is updated over time as workout progress changes the user's plan.
 
 ### 16.5 Indexing and Retrieval
 
@@ -972,7 +1307,14 @@ FUNCTION run_agent_turn(run_input: RuntimeInput) -> RunResult:
 - [ ]  Retrieval can be stale only within async sync window, with visible watermark metrics.
 - [ ]  Full Redis index rebuild from Postgres is supported and documented.
 
-### 16.6 Delivery and Streaming
+### 16.6 Trainer Tools and Workout State
+
+- [ ]  The trainer acts through a typed tool registry covering context recall, workout execution, live adjustment, program management, calculations, and memory writes.
+- [ ]  `workout_generate` creates a workout session structure when the user is ready to train.
+- [ ]  Exercise library definition, program prescription, and live workout execution state are represented as separate data layers.
+- [ ]  The persistent workout tray is backed by live `WorkoutSessionState` rather than inline feed cards.
+
+### 16.7 Delivery and Streaming
 
 - [ ]  Streaming emits lifecycle and delta events during run execution.
 - [ ]  SSE reconnect supports resume via `Last-Event-ID` or `since` cursor.
@@ -981,8 +1323,12 @@ FUNCTION run_agent_turn(run_input: RuntimeInput) -> RunResult:
 - [ ]  Final run output is durably persisted regardless of stream disconnect.
 - [ ]  Outbox retries transient failures and records terminal failures.
 - [ ]  Duplicate final deliveries are prevented by idempotency constraints.
+- [ ]  Heartbeat runs are pre-gated by proactive feature enablement, quiet hours, active run/workout state, recency, and candidate-reason checks before any LLM call.
+- [ ]  Heartbeat result contract supports `HEARTBEAT_OK`, `THREAD_ONLY`, and `THREAD_PLUS_PUSH`.
+- [ ]  Server-side delivery policy can downgrade `THREAD_PLUS_PUSH` to `THREAD_ONLY`.
+- [ ]  Proactive thread messages are visibly marked in the UI as having arrived while the user was away.
 
-### 16.7 Client View Aggregation and UX Contract
+### 16.8 Client View Aggregation and UX Contract
 
 - [ ]  The primary coach screen is driven by one aggregated backend payload rather than many client-side orchestration requests.
 - [ ]  Aggregated client payloads combine canonical session/run/workout/feed state without creating alternate business truth.
@@ -990,7 +1336,7 @@ FUNCTION run_agent_turn(run_input: RuntimeInput) -> RunResult:
 - [ ]  The workout tray expands upward in place above the input dock and does not cover or replace the persistent input dock.
 - [ ]  During workout-active states, the current exercise or rest state is controlled through the persistent workout tray, while inline feed UI remains reserved for contextual and reflective components.
 
-### 16.8 Prompt Layers and Bootstrap Lifecycle
+### 16.9 Prompt Layers and Bootstrap Lifecycle
 
 - [ ]  Prompt assembly separates runtime rules, coaching principles, coach identity, structured program state, and evolving memory into distinct layers.
 - [ ]  `coach_soul` is stored per user as Markdown text and loaded on every run for that user.
@@ -999,7 +1345,7 @@ FUNCTION run_agent_turn(run_input: RuntimeInput) -> RunResult:
 - [ ]  `system_prompt` and `coach_principles` remain curated and are not freely rewritten during normal operation.
 - [ ]  Evolving personalization is stored in `memory_markdown` and `episodic_notes`, while training structure evolves in `program_markdown`, instead of drifting the trainer identity layer.
 
-### 16.9 Policy, Cost, and Safety Enforcement
+### 16.10 Policy, Cost, and Safety Enforcement
 
 - [ ]  Effective policy resolution merges global, plan, and user overrides.
 - [ ]  Plan-tier knobs control indexing, retrieval, sources, and embedding budget.
@@ -1008,7 +1354,7 @@ FUNCTION run_agent_turn(run_input: RuntimeInput) -> RunResult:
 - [ ]  Safety signals trigger deterministic escalation/constraint behavior.
 - [ ]  All policy, safety, and redaction decisions are auditable.
 
-### 16.10 Provider Adapter Portability
+### 16.11 Provider Adapter Portability
 
 - [ ]  Provider adapter layer supports OpenAI, Anthropic, and Gemini via one stable runtime contract.
 - [ ]  Transcript hygiene is provider-aware and deterministic before each model run.
@@ -1017,7 +1363,7 @@ FUNCTION run_agent_turn(run_input: RuntimeInput) -> RunResult:
 - [ ]  Provider errors map to stable retryable/non-retryable/internal classes.
 - [ ]  Switching providers requires no changes to session, memory, indexing, or retrieval schemas.
 
-### 16.11 Cross-Feature Parity Matrix
+### 16.12 Cross-Feature Parity Matrix
 
 | Test Case | OpenAI | Anthropic | Gemini | Memory-Only Plan | Premium Hybrid Plan |
 | --- | --- | --- | --- | --- | --- |
@@ -1026,16 +1372,18 @@ FUNCTION run_agent_turn(run_input: RuntimeInput) -> RunResult:
 | Daily memory flush on compaction cycle | [ ] | [ ] | [ ] | [ ] | [ ] |
 | Session indexing obeys delta thresholds | [ ] | [ ] | [ ] | [ ] | [ ] |
 | Hybrid retrieval returns traceable provenance | [ ] | [ ] | [ ] | [ ] | [ ] |
+| Live workout tools mutate current session state without corrupting program/library layers | [ ] | [ ] | [ ] | [ ] | [ ] |
 | Final delivery survives stream disconnect | [ ] | [ ] | [ ] | [ ] | [ ] |
 | SSE reconnect replays missed events and resumes live | [ ] | [ ] | [ ] | [ ] | [ ] |
 | Rate limiting returns structured `429` with retry metadata | [ ] | [ ] | [ ] | [ ] | [ ] |
+| Heartbeat proactive message is added to thread and push-downgraded by server policy when needed | [ ] | [ ] | [ ] | [ ] | [ ] |
 | Bootstrap flow seeds memory, program, and stable coach soul | [ ] | [ ] | [ ] | [ ] | [ ] |
 | Semantic tool errors recover within run with structured guidance | [ ] | [ ] | [ ] | [ ] | [ ] |
 | Budget limit blocks embedding with graceful degradation | [ ] | [ ] | [ ] | [ ] | [ ] |
 | Safety escalation path emits safety events | [ ] | [ ] | [ ] | [ ] | [ ] |
 | Canonical tool definitions execute through adapter mappings | [ ] | [ ] | [ ] | [ ] | [ ] |
 
-### 16.12 Integration Smoke Test
+### 16.13 Integration Smoke Test
 
 ```
 -- Setup
@@ -1073,6 +1421,11 @@ ASSERT surface.status == 200
 ASSERT surface.payload.feed is not NONE
 ASSERT surface.payload.workout is not NONE OR surface.payload.run is not NONE
 
+-- Workout generation
+generated = workout_generate(user_id, guidance={ ready_now: true })
+ASSERT generated.workout_session_id is not NONE
+ASSERT LENGTH(generated.exercises) > 0
+
 -- Worker run and lock behavior
 job = dequeue("agent.run_turn")
 ASSERT job.session_key == "user:u_123:main"
@@ -1087,6 +1440,11 @@ ASSERT event.event_type == "conversation.user_message" OR event.event_type == "w
 tool_result = execute_tool_with_recovery(invalid_semantic_adjustment_call)
 ASSERT tool_result.status == "semantic_error"
 ASSERT tool_result.error.agent_guidance is not NONE
+
+-- Live workout mutation
+current = workout_get_current_state(user_id)
+adjusted = workout_adjust_load(current.workout_session_id, delta=5)
+ASSERT adjusted.current_exercise_id == current.current_exercise_id
 
 -- Flush + memory write
 flush_job = enqueue("memory.flush_session_end", { session_key: job.session_key })
@@ -1121,6 +1479,20 @@ ASSERT expired.error_code == "replay_window_expired"
 fallback = GET /runs/{job.run_id}/result
 ASSERT fallback.status == 200
 ASSERT fallback.payload is not NONE
+
+-- Heartbeat gating + delivery enforcement
+hb_skip = maybe_run_heartbeat(user_id, now=quiet_hours_time)
+ASSERT hb_skip.status == "skipped"
+
+hb = run_heartbeat_once(user_id, now=active_hours_time)
+ASSERT hb.result IN ["HEARTBEAT_OK", "THREAD_ONLY", "THREAD_PLUS_PUSH"]
+
+delivery = enforce_heartbeat_delivery(user_id_with_push_disabled, "THREAD_PLUS_PUSH")
+ASSERT delivery == "THREAD_ONLY"
+
+proactive_msg = append_proactive_thread_message(user_id, "Coach message", delivery)
+ASSERT proactive_msg.thread_visible == true
+ASSERT proactive_msg.away_marker == true
 
 -- Concurrency conflict safety
 start_worker_a(job.session_key)

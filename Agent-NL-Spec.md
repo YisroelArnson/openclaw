@@ -16,11 +16,11 @@ This document is a language-agnostic NLSpec for implementing the AI Personal Tra
 8. [Indexing and Retrieval](#8-indexing-and-retrieval)
 9. [Delivery and Streaming](#9-delivery-and-streaming)
 10. [Policy, Plan Tiers, and Cost Controls](#10-policy-plan-tiers-and-cost-controls)
-11. [Safety, Redaction, and Compliance Controls](#11-safety-redaction-and-compliance-controls)
+11. [Redaction and Risk Controls](#11-redaction-and-risk-controls)
 12. [Prompt Layers and Lifecycle](#12-prompt-layers-and-lifecycle)
 13. [Provider Adapter Architecture](#13-provider-adapter-architecture)
 14. [Out of Scope (Current Version)](#14-out-of-scope-current-version)
-15. [Open Questions Requiring Clarification](#15-open-questions-requiring-clarification)
+15. [Current Defaults and Deferred Design Areas](#15-current-defaults-and-deferred-design-areas)
 16. [Definition of Done](#16-definition-of-done)
 
 ---
@@ -43,7 +43,7 @@ The system must support many concurrent users, preserve deterministic per-sessio
 
 **Typed event auditability.** All significant system behavior must be stored as typed append-only events with provenance, timestamps, and actor metadata.
 
-**Memory as layered system.** Session memory, semantic memory, daily episodic memory, and program memory must be separated but queryable through unified retrieval.
+**Memory as layered system.** Session memory, semantic memory, date-keyed episodic memory, and program memory must be separated but queryable through unified retrieval.
 
 **Cost-aware by design.** Indexing and retrieval must be configurable per user plan with explicit knobs for budget and recall depth.
 
@@ -179,14 +179,13 @@ The overall effect should feel like one calm coaching surface: the chat handles 
 | `provider_adapter_module` | provider-specific request/stream/tool adaptations behind a stable runtime contract | adapter interfaces |
 | `feed_contract_module` | typed message and inline-component payload contracts for the client feed | API schemas |
 | `bff_module` | aggregate frontend-ready view models and feed payloads so clients do not orchestrate many backend calls | API view-model services |
-| `memory_module` | MEMORY/PROGRAM/DAILY docs + versions | memory services |
+| `memory_module` | MEMORY/PROGRAM/date-keyed episodic docs + versions | memory services |
 | `trainer_tools_module` | typed trainer action catalog and execution handlers | tool registry + handlers |
 | `workout_module` | live workout state, exercise progression, and tray-backed current action state | workout services |
 | `indexing_module` | extract/redact/chunk/embed/upsert | worker handlers |
 | `retrieval_module` | hybrid vector + FTS search | retrieval API |
 | `delivery_module` | streaming + durable final delivery | SSE + outbox |
 | `policy_module` | plan-tier controls and budgets | policy resolver |
-| `safety_module` | risk handling and redaction controls | policy + filters |
 | `observability_module` | logs, metrics, traces, admin ops | telemetry + admin APIs |
 
 ### 3.2 Module Dependency Direction
@@ -203,6 +202,7 @@ The overall effect should feel like one calm coaching surface: the chat handles 
 3. Aggregated client payloads must be derived from canonical Postgres state, with Redis used only as an acceleration layer for cacheable reads.
 4. BFF aggregation must not create alternate business truth; it is a read-model layer over canonical state.
 5. The client feed contract should prefer one ordered response payload over many chat-adjacent support requests.
+6. The exact coach-surface payload schema, tray payload schema, and feed item schemas are intentionally deferred and must be defined before frontend implementation begins.
 
 ```pseudocode
 FUNCTION build_coach_surface(user_id: String, session_key: String) -> CoachSurfaceView:
@@ -378,7 +378,7 @@ FUNCTION handle_user_ready_to_work_out(user_id: String, guidance: Dict) -> Worko
 13. `stream_events`
 14. `delivery_outbox`
 15. `idempotency_keys`
-16. `safety_flags`
+16. `risk_flags`
 
 ### 4.1.1 Data Residency and Durability
 
@@ -570,6 +570,8 @@ This layer represents plan intent:
 
 This layer may evolve as the agent updates `program_markdown`.
 
+The program source of truth is `program_markdown`, stored as versioned Markdown content in Postgres. The exact internal Markdown structure for the program is intentionally deferred and must be defined before implementation of program parsing and mutation logic.
+
 #### 4.4.3 Live Workout Execution Layer
 
 `WorkoutSessionState` and `WorkoutExerciseState` represent what is happening right now in the active workout.
@@ -587,7 +589,7 @@ It must support:
 #### 4.4.4 Tool Interaction Contract
 
 1. `workout_adjust_*` tools should mutate live workout state, not the exercise library.
-2. `program_*` tools should mutate `program_markdown` and future training prescription, not rewrite completed workout history.
+2. program-related tools should mutate `program_markdown` and future training prescription, not rewrite completed workout history.
 3. `workout_complete_set` and related tools should update `WorkoutSetState` and advance live workout flow.
 4. The workout tray should be backed by `WorkoutSessionState.current_phase`, the current `WorkoutExerciseState`, and the current `WorkoutSetState`.
 
@@ -606,8 +608,14 @@ It must support:
 
 1. Manual reset request.
 2. Idle expiry threshold.
-3. Optional day-boundary policy.
-4. Safety-driven forced reset (optional policy).
+3. Day-boundary rotation should be enabled by default.
+4. Session reset policy must be configurable per user/plan.
+
+Default reset posture:
+
+1. `day_boundary_enabled = true`
+2. `idle_expiry_minutes = 180`
+3. whichever reset boundary is reached first should trigger the next `sessionId` rotation.
 
 ### 5.3 Session Resolve Algorithm
 
@@ -637,6 +645,7 @@ FUNCTION resolve_or_create_session(user_id: String, now: Timestamp) -> SessionSt
 2. Parent link must reference current leaf unless explicit branch operation.
 3. Leaf update must be optimistic and atomic.
 4. Duplicate idempotency keys must not create duplicate events.
+5. Tree-linked transcript structure is internal only and must not be exposed as branch navigation in the user-facing UX.
 
 ```
 FUNCTION append_session_event(state: SessionState, event: SessionEventInput) -> SessionEvent:
@@ -715,6 +724,18 @@ FUNCTION process_session_mutating_job(job):
 1. Blocking lock mode: wait for lock and continue.
 2. Try-lock mode: fail fast and requeue.
 3. System default should use try-lock with bounded exponential backoff.
+4. Retry backoff must use exponential backoff with jitter.
+
+### 6.5 Deferred Queue and Worker Design Details
+
+The current architecture intentionally leaves some worker-system details to be defined during implementation design. These items must be specified before production implementation:
+
+1. queue topology and queue names,
+2. worker-role to queue assignment,
+3. job payload envelopes and per-job schemas,
+4. dead-letter and replay policy,
+5. stalled-job recovery behavior,
+6. durable reconciliation procedure after partial queue/runtime failure.
 
 ---
 
@@ -724,7 +745,7 @@ FUNCTION process_session_mutating_job(job):
 
 1. `MEMORY` doc for semantic user facts/preferences.
 2. `PROGRAM` doc for current training program.
-3. `DAILY` docs keyed by user-local date (`YYYY-MM-DD`).
+3. `EPISODIC_DATE` docs keyed by user-local date (`YYYY-MM-DD`).
 4. Session events as episodic searchable source.
 
 ### 7.2 Durable Document Contract
@@ -733,8 +754,8 @@ FUNCTION process_session_mutating_job(job):
 RECORD MemoryDoc:
     doc_id            : String
     user_id           : String
-    doc_type          : String              -- MEMORY | PROGRAM | DAILY
-    doc_key           : String              -- e.g., "DAILY:2026-02-25"
+    doc_type          : String              -- MEMORY | PROGRAM | EPISODIC_DATE
+    doc_key           : String              -- e.g., "EPISODIC_DATE:2026-02-25"
     current_version   : Integer
     updated_at        : Timestamp
 
@@ -748,23 +769,36 @@ RECORD MemoryDocVersion:
     created_at        : Timestamp
 ```
 
-### 7.3 Daily Memory Creation Rules
+### 7.3 Date-Keyed Episodic Note Creation Rules
 
-1. Daily docs are created by actual writes, not empty daily pre-creation.
+1. Date-keyed episodic notes are created by actual writes, not empty daily pre-creation.
 2. Trigger sources:
 3. pre-compaction flush
 4. session-end flush
 5. user/manual edits
 6. agent explicit memory writes
+7. not every calendar day should have an episodic note.
+8. Pre-compaction and session-end flushes should run silently in the background and should not notify the user by default.
 
 ### 7.4 Read Rules for New Session Start
 
-System should support configurable read strategy:
+System should support configurable read strategy for date-keyed episodic notes:
 
 1. `today_only`
 2. `today_and_yesterday`
 3. `current_week`
 4. `custom_window_days`
+
+Default posture:
+
+1. `today_and_yesterday` should be the default read window.
+2. Read window must remain configurable per user/plan so higher tiers can use larger context windows.
+
+### 7.5 Retention Rules
+
+1. Raw `session_events` must be retained indefinitely by default.
+2. Versioned memory and program documents must be retained indefinitely by default.
+3. Indexed chunks and retrieval provenance must be retained indefinitely by default.
 
 ---
 
@@ -828,7 +862,7 @@ Each result must include:
 
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
-| `source_type` | `String` | none | sessions/memory/program/daily |
+| `source_type` | `String` | none | sessions/memory/program/episodic_date |
 | `source_id` | `String` | none | session/doc identity |
 | `start_seq_or_offset` | `Integer` | none | provenance start |
 | `end_seq_or_offset` | `Integer` | none | provenance end |
@@ -900,6 +934,8 @@ Pre-run gating should consider at least:
 6. whether any candidate reason exists to speak.
 
 If no candidate reason exists, or if policy says the coach should remain quiet, the heartbeat run should be skipped before calling the model.
+
+The exact candidate-reason taxonomy is intentionally deferred and must be defined before production implementation of heartbeat behavior.
 
 #### 9.5.3 Heartbeat Result Contract
 
@@ -985,7 +1021,7 @@ Policy hierarchy:
 | `query.maxResults` | `Integer` | `8` | final retrieval result count |
 | `query.candidateMultiplier` | `Integer` | `4` | candidate pool multiplier |
 | `query.backend` | `String` | `"redis_hybrid"` | retrieval backend (`redis_hybrid` or `postgres_fallback`) |
-| `sources` | `List<String>` | `["sessions","memory","program","daily"]` | enabled retrieval sources |
+| `sources` | `List<String>` | `["sessions","memory","program","episodic_date"]` | enabled retrieval sources |
 | `embedding.monthlyBudget` | `Integer` | plan-defined | optional embedding spend cap |
 | `queue.retry.maxAttempts` | `Integer` | `8` | max retry attempts before dead-letter |
 | `queue.retry.baseDelayMs` | `Integer` | `1000` | initial retry delay |
@@ -1001,6 +1037,12 @@ Policy hierarchy:
 | `concurrency.maxActiveStreamsPerDevice` | `Integer` | plan-defined | maximum concurrent SSE streams per device |
 | `rateLimit.retryHintSeconds` | `Integer` | `30` | retry hint included in `429` responses |
 
+Default embedding monthly budgets:
+
+1. `memory_only = 0`
+2. `standard = 5_000_000`
+3. `premium_hybrid = 20_000_000`
+
 ### 10.3 Enforcement Rules
 
 1. Policy checks must happen server-side.
@@ -1011,7 +1053,7 @@ Policy hierarchy:
 
 ---
 
-## 11. Safety, Redaction, and Compliance Controls
+## 11. Redaction and Risk Controls
 
 ### 11.1 Redaction Rules
 
@@ -1019,13 +1061,13 @@ Policy hierarchy:
 2. Raw events remain in audit store only under authorized access policies.
 3. Retrieval must not return disallowed classes.
 
-### 11.2 Safety Runtime Rules
+### 11.2 Minimal Risk Runtime Rules
 
 1. Critical injury/emergency signals must trigger escalation behavior.
-2. Safety events must be appended as `safety.*` events.
+2. Risk events must be appended as `risk.*` events.
 3. Unsafe recommendation paths should be interrupted or constrained by policy.
 
-### 11.3 Safety/Redaction Audit Fields
+### 11.3 Redaction/Risk Audit Fields
 
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -1247,16 +1289,31 @@ FUNCTION run_agent_turn(run_input: RuntimeInput) -> RunResult:
 
 ---
 
-## 15. Open Questions Requiring Clarification
+## 15. Current Defaults and Deferred Design Areas
 
-1. Should `sessionId` day-boundary rotation be enabled by default, or only idle/manual reset for v1 rollout?
-2. For daily memory reads at new-session start, should default be `today_and_yesterday` or `current_week`?
-3. Should users be notified every time a pre-compaction/session-end memory flush occurs, or only when user-visible summary is generated?
-4. What retention policy should apply to raw `session_events` and indexed chunks by plan tier?
-5. Do you want branch navigation exposed in user-facing UX now, or keep tree structure internal only?
-6. Should `PROGRAM` edits require user confirmation gates for specific risky changes (e.g., large load jumps)?
-7. What exact monthly embedding budget defaults do you want for each plan tier?
-8. Should try-lock requeue backoff use fixed intervals or exponential with jitter as mandatory behavior?
+### 15.1 Current Defaults
+
+1. `sessionId` day-boundary rotation is enabled by default.
+2. Idle expiry is enabled by default with `180` minutes, and reset policy remains configurable per user/plan.
+3. New-session episodic-note reads default to `today_and_yesterday`, with larger read windows allowed by plan/user policy.
+4. Pre-compaction and session-end memory flushes are silent background operations and do not notify the user by default.
+5. Raw `session_events`, versioned documents, and indexed chunks are retained indefinitely by default.
+6. Tree-linked session structure remains internal only and is not exposed as user-facing branch navigation.
+7. Program edits do not require user confirmation by default.
+8. Retry backoff should use exponential backoff with jitter.
+9. Default embedding monthly budgets are:
+10. `memory_only = 0`
+11. `standard = 5_000_000`
+12. `premium_hybrid = 20_000_000`
+
+### 15.2 Deferred Design Areas
+
+The following areas are intentionally deferred and must be specified in later design passes before production implementation:
+
+1. queue topology, worker-role assignment, job payload schemas, dead-letter policy, and stalled-job recovery,
+2. exact `program_markdown` structure and parsing model,
+3. exact heartbeat candidate-reason taxonomy,
+4. exact BFF/feed/tray payload schemas and client event contracts.
 
 ---
 
@@ -1278,7 +1335,7 @@ FUNCTION run_agent_turn(run_input: RuntimeInput) -> RunResult:
 - [ ]  `session_events` is append-only and immutable after insert.
 - [ ]  Parent linkage is enforced and leaf pointer advances atomically.
 - [ ]  Event catalog supports `context_includable`, `indexable`, and `audit_only` flags.
-- [ ]  Workout, program, memory, safety, and system event families are implemented.
+- [ ]  Workout, program, memory, risk, and system event families are implemented.
 - [ ]  Semantic tool failures are recorded as explicit structured events with agent-facing guidance.
 
 ### 16.3 Queue, Workers, and Concurrency
@@ -1292,8 +1349,8 @@ FUNCTION run_agent_turn(run_input: RuntimeInput) -> RunResult:
 
 ### 16.4 Memory and Document Lifecycle
 
-- [ ]  `MEMORY`, `PROGRAM`, and `DAILY` docs exist as versioned DB records.
-- [ ]  Pre-compaction and session-end flush paths can create/update daily docs.
+- [ ]  `MEMORY`, `PROGRAM`, and `EPISODIC_DATE` docs exist as versioned DB records.
+- [ ]  Pre-compaction and session-end flush paths can create/update date-keyed episodic notes.
 - [ ]  New-session memory reads follow configured window policy.
 - [ ]  Memory writes are attributable to actor and run/session provenance.
 - [ ]  `program_markdown` is updated over time as workout progress changes the user's plan.
@@ -1351,8 +1408,8 @@ FUNCTION run_agent_turn(run_input: RuntimeInput) -> RunResult:
 - [ ]  Plan-tier knobs control indexing, retrieval, sources, and embedding budget.
 - [ ]  Plan-tier knobs control request rate limits and concurrency admission limits.
 - [ ]  Redaction rules execute before indexed storage.
-- [ ]  Safety signals trigger deterministic escalation/constraint behavior.
-- [ ]  All policy, safety, and redaction decisions are auditable.
+- [ ]  High-risk injury/emergency signals trigger deterministic escalation/constraint behavior.
+- [ ]  All policy, redaction, and high-risk escalation decisions are auditable.
 
 ### 16.11 Provider Adapter Portability
 
@@ -1369,7 +1426,7 @@ FUNCTION run_agent_turn(run_input: RuntimeInput) -> RunResult:
 | --- | --- | --- | --- | --- | --- |
 | Inbound user message accepted and persisted | [ ] | [ ] | [ ] | [ ] | [ ] |
 | Per-session lock prevents concurrent head corruption | [ ] | [ ] | [ ] | [ ] | [ ] |
-| Daily memory flush on compaction cycle | [ ] | [ ] | [ ] | [ ] | [ ] |
+| Date-keyed episodic note flush on compaction cycle | [ ] | [ ] | [ ] | [ ] | [ ] |
 | Session indexing obeys delta thresholds | [ ] | [ ] | [ ] | [ ] | [ ] |
 | Hybrid retrieval returns traceable provenance | [ ] | [ ] | [ ] | [ ] | [ ] |
 | Live workout tools mutate current session state without corrupting program/library layers | [ ] | [ ] | [ ] | [ ] | [ ] |
@@ -1380,7 +1437,7 @@ FUNCTION run_agent_turn(run_input: RuntimeInput) -> RunResult:
 | Bootstrap flow seeds memory, program, and stable coach soul | [ ] | [ ] | [ ] | [ ] | [ ] |
 | Semantic tool errors recover within run with structured guidance | [ ] | [ ] | [ ] | [ ] | [ ] |
 | Budget limit blocks embedding with graceful degradation | [ ] | [ ] | [ ] | [ ] | [ ] |
-| Safety escalation path emits safety events | [ ] | [ ] | [ ] | [ ] | [ ] |
+| High-risk escalation path emits risk events | [ ] | [ ] | [ ] | [ ] | [ ] |
 | Canonical tool definitions execute through adapter mappings | [ ] | [ ] | [ ] | [ ] | [ ] |
 
 ### 16.13 Integration Smoke Test
@@ -1449,8 +1506,8 @@ ASSERT adjusted.current_exercise_id == current.current_exercise_id
 -- Flush + memory write
 flush_job = enqueue("memory.flush_session_end", { session_key: job.session_key })
 process(flush_job)
-daily_doc = get_memory_doc(user_id, "DAILY", current_user_date(user_id))
-ASSERT daily_doc is not NONE
+episodic_doc = get_memory_doc(user_id, "EPISODIC_DATE", current_user_date(user_id))
+ASSERT episodic_doc is not NONE
 
 -- Indexing
 index_job = enqueue("memory.index_session_delta", { session_key: job.session_key })
@@ -1514,7 +1571,7 @@ ASSERT NOT (worker_a.mutates_head AND worker_b.mutates_head at same time)
 | `workout.*` | `workout.exercise.skipped` | `true` | `true` | `false` |
 | `program.*` | `program.updated` | `true` | `true` | `false` |
 | `memory.*` | `memory.flush.executed` | `false` | `false` | `true` |
-| `safety.*` | `safety.alert` | `true` | `optional` | `false` |
+| `risk.*` | `risk.alert` | `true` | `optional` | `false` |
 | `system.*` | `system.retry` | `false` | `false` | `true` |
 | `compaction.*` | `compaction.summary` | `true` | `true` | `false` |
 
